@@ -212,10 +212,21 @@ bash: -c: line 1: syntax error near unexpected token `then'
                     status: .unknown,
                     prettyName: "p3000"
                 ),
+                ServiceRecord(
+                    hostID: hostID,
+                    hostName: "srv",
+                    remotePort: RemotePort(bindAddress: "127.0.0.1", port: 22),
+                    localPort: 24_003,
+                    enabled: false,
+                    status: .unknown,
+                    prettyName: "p22"
+                ),
             ]
         )
     )
     let state = await AppState(settingsStore: store)
+    let stored = await state.services
+    #expect(!stored.contains { $0.remotePort.port == 22 })
     let visible = await state.visibleServices
     #expect(visible.count == 1)
     #expect(visible[0].remotePort.port == 3000)

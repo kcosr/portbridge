@@ -1,226 +1,159 @@
 import AppKit
 import PortBridgeCore
+import SwiftUI
 
 @MainActor
-final class MenuController: NSObject, NSMenuDelegate {
+final class MenuController: NSObject, NSPopoverDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let menu = NSMenu()
+    private let popover = NSPopover()
     private let appState: AppState
+    private let refreshModel = PopoverRefreshModel()
     private var addHostController: AddHostWindowController?
-    private var isMenuOpen = false
-    private var needsMenuRebuild = false
+    private var hostingController: NSHostingController<PortBridgePopoverView>?
 
     init(appState: AppState) {
         self.appState = appState
         super.init()
-        statusItem.button?.image = nil
-        statusItem.button?.title = "PB"
-        menu.delegate = self
-        statusItem.menu = menu
+        configureStatusItem()
+        configurePopover()
         appState.onChange = { [weak self] in
             Task { @MainActor in
-                self?.scheduleMenuRebuild()
+                guard let self, self.popover.isShown else { return }
+                self.refreshModel.refresh()
             }
         }
-        rebuildMenu()
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
-        isMenuOpen = true
-        needsMenuRebuild = false
-        rebuildMenu()
+    private func configureStatusItem() {
+        guard let button = statusItem.button else { return }
+        button.image = nil
+        button.title = "PB"
+        button.target = self
+        button.action = #selector(togglePopover)
     }
 
-    func menuDidClose(_ menu: NSMenu) {
-        isMenuOpen = false
-        if needsMenuRebuild {
-            needsMenuRebuild = false
-            rebuildMenu()
+    private func configurePopover() {
+        popover.behavior = .transient
+        popover.animates = true
+        popover.delegate = self
+        let controller = NSHostingController(rootView: makePopoverView())
+        popover.contentSize = preferredPopoverSize()
+        controller.view.frame = NSRect(origin: .zero, size: popover.contentSize)
+        hostingController = controller
+        popover.contentViewController = controller
+    }
+
+    private func makePopoverView() -> PortBridgePopoverView {
+        PortBridgePopoverView(
+            appState: appState,
+            refreshModel: refreshModel,
+            size: popover.contentSize,
+            actions: makeActions()
+        )
+    }
+
+    @objc private func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            resizePopoverForCurrentContent()
+            refreshModel.refresh()
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
         }
     }
 
-    private func scheduleMenuRebuild() {
-        if isMenuOpen {
-            needsMenuRebuild = true
-            return
-        }
-        rebuildMenu()
+    private func resizePopoverForCurrentContent() {
+        let size = preferredPopoverSize()
+        popover.contentSize = size
+        hostingController?.rootView = PortBridgePopoverView(
+            appState: appState,
+            refreshModel: refreshModel,
+            size: size,
+            actions: makeActions()
+        )
     }
 
-    private func rebuildMenu() {
-        menu.removeAllItems()
+    private func preferredPopoverSize() -> NSSize {
+        let width: CGFloat = 640
+        let maxHeight = min(NSScreen.main?.visibleFrame.height ?? 820, 820) - 80
+        let height = min(max(260, estimatedContentHeight()), maxHeight)
+        return NSSize(width: width, height: height)
+    }
 
-        let proxyTitle = appState.proxyRunning
-            ? "Proxy: http://*.localhost:\(appState.configuration.proxyPort)"
-            : "Proxy stopped"
-        menu.addItem(disabled(proxyTitle))
-        if let error = appState.lastError {
-            menu.addItem(disabled("Last error: \(error)"))
+    private func estimatedContentHeight() -> CGFloat {
+        var height: CGFloat = 105
+        if appState.lastError != nil {
+            height += 42
         }
-        menu.addItem(.separator())
 
         if appState.hosts.isEmpty {
-            menu.addItem(disabled("No SSH hosts yet"))
-        } else {
-            for host in appState.hosts {
-                menu.addItem(hostMenuItem(host))
-            }
+            return height + 96
         }
 
-        menu.addItem(.separator())
-        menu.addItem(actionItem("Import ~/.ssh/config Hosts", action: #selector(importSSHConfig)))
-        menu.addItem(actionItem("Add Host...", action: #selector(addHost)))
-        menu.addItem(actionItem("Open Config File", action: #selector(openConfig)))
-        menu.addItem(.separator())
-        menu.addItem(actionItem("Restart Proxy", action: #selector(restartProxy)))
-        menu.addItem(actionItem("Quit PortBridge", action: #selector(quit)))
+        for host in appState.hosts {
+            let hostServices = appState.visibleServices.filter { $0.hostID == host.id }
+            let activeServices = hostServices.filter { $0.enabled && $0.status == .web }
+            let disabledServices = hostServices.filter { !$0.enabled || $0.status != .web }
+            var panelHeight: CGFloat = 64
+
+            if activeServices.isEmpty && disabledServices.isEmpty {
+                panelHeight += 34
+            }
+            if !activeServices.isEmpty {
+                panelHeight += 28
+                panelHeight += CGFloat(activeServices.count) * 58
+                if activeServices.contains(where: \.enabled) {
+                    panelHeight += 28
+                }
+            }
+            if !disabledServices.isEmpty {
+                panelHeight += 32
+            }
+
+            height += panelHeight + 14
+        }
+        return height
     }
 
-    private func hostMenuItem(_ host: HostProfile) -> NSMenuItem {
-        let hostServices = services(for: host)
-        let webCount = hostServices.filter { $0.status == .web }.count
-        let count = webCount > 0 ? "\(webCount)" : "\(hostServices.count)"
-        let connection = host.enabled ? "Connected" : "Disabled"
-        let scanState = appState.isScanning(host.id) ? "Scanning" : connection
-        let item = NSMenuItem(title: "\(host.displayName)  \(scanState)  \(count)", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-
-        let toggle = actionItem(host.enabled ? "Disable Host" : "Enable Host", action: #selector(toggleHost(_:)))
-        toggle.representedObject = host.id.uuidString
-        submenu.addItem(toggle)
-
-        let autoForward = actionItem("Auto Forward New Ports", action: #selector(toggleHostAutoForward(_:)))
-        autoForward.representedObject = host.id.uuidString
-        autoForward.state = host.autoForward ? .on : .off
-        submenu.addItem(autoForward)
-
-        let scan = actionItem("Scan Now", action: #selector(scanHost(_:)))
-        scan.representedObject = host.id.uuidString
-        submenu.addItem(scan)
-
-        if hostServices.contains(where: { $0.enabled }) {
-            let disableAll = actionItem("Disable All Forwards", action: #selector(disableAllForwards(_:)))
-            disableAll.representedObject = host.id.uuidString
-            submenu.addItem(disableAll)
-        }
-
-        if let summary = appState.lastScanSummary(for: host.id) {
-            submenu.addItem(disabled(summary))
-        }
-
-        let remove = actionItem("Remove Host", action: #selector(removeHost(_:)))
-        remove.representedObject = host.id.uuidString
-        submenu.addItem(remove)
-        submenu.addItem(.separator())
-
-        let activeServices = hostServices.filter { $0.enabled && $0.status == .web }
-        let disabledServices = hostServices.filter { !$0.enabled || $0.status != .web }
-
-        if hostServices.isEmpty {
-            submenu.addItem(disabled("No ports discovered yet"))
-        } else if activeServices.isEmpty {
-            submenu.addItem(disabled("No HTTP services detected"))
-        } else {
-            for service in activeServices {
-                submenu.addItem(serviceMenuItem(service))
-            }
-        }
-
-        if !disabledServices.isEmpty {
-            let disabledItem = NSMenuItem(title: "Disabled Ports  \(disabledServices.count)", action: nil, keyEquivalent: "")
-            let disabledMenu = NSMenu()
-            for service in disabledServices {
-                disabledMenu.addItem(serviceMenuItem(service))
-            }
-            disabledItem.submenu = disabledMenu
-            submenu.addItem(disabledItem)
-        }
-
-        item.submenu = submenu
-        return item
+    private func makeActions() -> PortBridgePopoverActions {
+        PortBridgePopoverActions(
+            importSSHConfig: { [weak self] in self?.importSSHConfig() },
+            addHost: { [weak self] in self?.addHost() },
+            openConfig: { [weak self] in self?.openConfig() },
+            openIndex: { [weak self] in self?.openIndex() },
+            restartProxy: { [weak self] in self?.restartProxy() },
+            quit: { [weak self] in self?.quit() },
+            toggleHost: { [weak self] id in self?.toggleHost(id) },
+            toggleHostAutoForward: { [weak self] id in self?.toggleHostAutoForward(id) },
+            scanHost: { [weak self] id in self?.scanHost(id) },
+            disableAllForwards: { [weak self] id in self?.disableAllForwards(id) },
+            removeHost: { [weak self] id in self?.removeHost(id) },
+            toggleService: { [weak self] id in self?.toggleService(id) },
+            forceHTTP: { [weak self] id in self?.forceHTTP(id) },
+            forceHTTPS: { [weak self] id in self?.forceHTTPS(id) },
+            openPrettyURL: { [weak self] id in self?.openService(id) },
+            copyPrettyURL: { [weak self] id in self?.copyServiceURL(id) },
+            openLocalhostURL: { [weak self] id in self?.openLocalhostService(id) },
+            copyLocalhostURL: { [weak self] id in self?.copyLocalhostServiceURL(id) }
+        )
     }
 
     private func services(for host: HostProfile) -> [ServiceRecord] {
         appState.visibleServices.filter { $0.hostID == host.id }
     }
 
-    private func serviceMenuItem(_ service: ServiceRecord) -> NSMenuItem {
-        let status = service.status == .web ? service.scheme?.rawValue.uppercased() ?? "WEB" : service.status.rawValue
-        let title = service.title ?? "\(service.remotePort.port)"
-        let item = NSMenuItem(title: "\(title)  :\(service.remotePort.port)  \(status)", action: nil, keyEquivalent: "")
-        let submenu = NSMenu()
-
-        let open = actionItem("Open Pretty URL", action: #selector(openService(_:)))
-        open.image = NSImage(systemSymbolName: "globe", accessibilityDescription: "Open")
-        open.representedObject = service.id.uuidString
-        open.isEnabled = service.enabled && service.status == .web
-        submenu.addItem(open)
-
-        let copy = actionItem("Copy Pretty URL", action: #selector(copyServiceURL(_:)))
-        copy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy")
-        copy.representedObject = service.id.uuidString
-        copy.isEnabled = service.enabled && service.status == .web
-        submenu.addItem(copy)
-
-        let localOpen = actionItem("Open Localhost URL", action: #selector(openLocalhostService(_:)))
-        localOpen.image = NSImage(systemSymbolName: "link", accessibilityDescription: "Open Localhost")
-        localOpen.representedObject = service.id.uuidString
-        localOpen.isEnabled = service.enabled
-        submenu.addItem(localOpen)
-
-        let localCopy = actionItem("Copy Localhost URL", action: #selector(copyLocalhostServiceURL(_:)))
-        localCopy.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy Localhost")
-        localCopy.representedObject = service.id.uuidString
-        localCopy.isEnabled = service.enabled
-        submenu.addItem(localCopy)
-
-        let toggle = actionItem(service.enabled ? "Disable Forward" : "Enable Forward", action: #selector(toggleService(_:)))
-        toggle.representedObject = service.id.uuidString
-        submenu.addItem(toggle)
-
-        if service.status != .web || service.scheme == nil {
-            let forceHTTP = actionItem("Force HTTP Route", action: #selector(forceHTTP(_:)))
-            forceHTTP.representedObject = service.id.uuidString
-            submenu.addItem(forceHTTP)
-
-            let forceHTTPS = actionItem("Force HTTPS Route", action: #selector(forceHTTPS(_:)))
-            forceHTTPS.representedObject = service.id.uuidString
-            submenu.addItem(forceHTTPS)
-        }
-
-        submenu.addItem(.separator())
-        submenu.addItem(disabled("Pretty: \(service.routeHost)"))
-        submenu.addItem(disabled("Remote: \(service.remotePort.bindAddress):\(service.remotePort.port)"))
-        submenu.addItem(disabled("Localhost: 127.0.0.1:\(service.localPort)"))
-        if let error = service.lastError {
-            submenu.addItem(disabled(error))
-        }
-
-        item.submenu = submenu
-        return item
-    }
-
-    private func disabled(_ title: String) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
-        item.isEnabled = false
-        return item
-    }
-
-    private func actionItem(_ title: String, action: Selector) -> NSMenuItem {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
-        item.target = self
-        return item
-    }
-
-    @objc private func importSSHConfig() {
+    private func importSSHConfig() {
         appState.importSSHConfigHosts()
     }
 
-    @objc private func restartProxy() {
+    private func restartProxy() {
         appState.startProxy()
+        refreshModel.refresh()
     }
 
-    @objc private func addHost() {
+    private func addHost() {
         let controller = AddHostWindowController { [weak self] alias, hostname, user, port in
             guard let self else { return }
             appState.addManualHost(
@@ -236,98 +169,443 @@ final class MenuController: NSObject, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func field(placeholder: String) -> NSTextField {
-        let field = NSTextField()
-        field.placeholderString = placeholder
-        field.bezelStyle = .roundedBezel
-        return field
-    }
-
-    @objc private func toggleHost(_ sender: NSMenuItem) {
-        guard let id = uuid(sender) else { return }
+    private func toggleHost(_ id: UUID) {
         let enabled = !(appState.hosts.first(where: { $0.id == id })?.enabled ?? false)
         appState.setHost(id, enabled: enabled)
     }
 
-    @objc private func scanHost(_ sender: NSMenuItem) {
-        guard let id = uuid(sender) else { return }
+    private func scanHost(_ id: UUID) {
         appState.scanNow(id)
     }
 
-    @objc private func toggleHostAutoForward(_ sender: NSMenuItem) {
-        guard let id = uuid(sender),
-              let host = appState.hosts.first(where: { $0.id == id }) else { return }
+    private func toggleHostAutoForward(_ id: UUID) {
+        guard let host = appState.hosts.first(where: { $0.id == id }) else { return }
         appState.setHostAutoForward(id, enabled: !host.autoForward)
     }
 
-    @objc private func disableAllForwards(_ sender: NSMenuItem) {
-        guard let id = uuid(sender) else { return }
+    private func disableAllForwards(_ id: UUID) {
         appState.disableAllForwards(for: id)
     }
 
-    @objc private func removeHost(_ sender: NSMenuItem) {
-        guard let id = uuid(sender) else { return }
+    private func removeHost(_ id: UUID) {
         appState.removeHost(id)
     }
 
-    @objc private func toggleService(_ sender: NSMenuItem) {
-        guard let id = uuid(sender),
-              let service = appState.services.first(where: { $0.id == id }) else { return }
+    private func toggleService(_ id: UUID) {
+        guard let service = appState.services.first(where: { $0.id == id }) else { return }
         appState.setService(id, enabled: !service.enabled)
     }
 
-    @objc private func forceHTTP(_ sender: NSMenuItem) {
-        guard let id = uuid(sender) else { return }
+    private func forceHTTP(_ id: UUID) {
         appState.forceHTTP(id)
     }
 
-    @objc private func forceHTTPS(_ sender: NSMenuItem) {
-        guard let id = uuid(sender) else { return }
+    private func forceHTTPS(_ id: UUID) {
         appState.forceHTTP(id, scheme: .https)
     }
 
-    @objc private func openService(_ sender: NSMenuItem) {
-        guard let id = uuid(sender),
-              let service = appState.services.first(where: { $0.id == id }),
+    private func openService(_ id: UUID) {
+        guard let service = appState.services.first(where: { $0.id == id }),
               let url = appState.url(for: service) else { return }
         NSWorkspace.shared.open(url)
     }
 
-    @objc private func copyServiceURL(_ sender: NSMenuItem) {
-        guard let id = uuid(sender),
-              let service = appState.services.first(where: { $0.id == id }),
+    private func copyServiceURL(_ id: UUID) {
+        guard let service = appState.services.first(where: { $0.id == id }),
               let url = appState.url(for: service) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
-    @objc private func openLocalhostService(_ sender: NSMenuItem) {
-        guard let id = uuid(sender),
-              let service = appState.services.first(where: { $0.id == id }),
+    private func openLocalhostService(_ id: UUID) {
+        guard let service = appState.services.first(where: { $0.id == id }),
               let url = appState.localhostURL(for: service) else { return }
         NSWorkspace.shared.open(url)
     }
 
-    @objc private func copyLocalhostServiceURL(_ sender: NSMenuItem) {
-        guard let id = uuid(sender),
-              let service = appState.services.first(where: { $0.id == id }),
+    private func copyLocalhostServiceURL(_ id: UUID) {
+        guard let service = appState.services.first(where: { $0.id == id }),
               let url = appState.localhostURL(for: service) else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
-    @objc private func openConfig() {
+    private func openConfig() {
         NSWorkspace.shared.activateFileViewerSelecting([appState.settingsStore.configurationURL])
     }
 
-    @objc private func quit() {
-        NSApp.terminate(nil)
+    private func openIndex() {
+        guard let url = URL(string: "http://127.0.0.1:\(appState.configuration.proxyPort)/") else { return }
+        NSWorkspace.shared.open(url)
     }
 
-    private func uuid(_ item: NSMenuItem) -> UUID? {
-        guard let text = item.representedObject as? String else { return nil }
-        return UUID(uuidString: text)
+    private func quit() {
+        NSApp.terminate(nil)
     }
+}
+
+@MainActor
+private final class PopoverRefreshModel: ObservableObject {
+    @Published var revision = 0
+
+    func refresh() {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            revision &+= 1
+        }
+    }
+}
+
+@MainActor
+private struct PortBridgePopoverActions {
+    var importSSHConfig: () -> Void
+    var addHost: () -> Void
+    var openConfig: () -> Void
+    var openIndex: () -> Void
+    var restartProxy: () -> Void
+    var quit: () -> Void
+    var toggleHost: (UUID) -> Void
+    var toggleHostAutoForward: (UUID) -> Void
+    var scanHost: (UUID) -> Void
+    var disableAllForwards: (UUID) -> Void
+    var removeHost: (UUID) -> Void
+    var toggleService: (UUID) -> Void
+    var forceHTTP: (UUID) -> Void
+    var forceHTTPS: (UUID) -> Void
+    var openPrettyURL: (UUID) -> Void
+    var copyPrettyURL: (UUID) -> Void
+    var openLocalhostURL: (UUID) -> Void
+    var copyLocalhostURL: (UUID) -> Void
+}
+
+@MainActor
+private struct PortBridgePopoverView: View {
+    let appState: AppState
+    @ObservedObject var refreshModel: PopoverRefreshModel
+    let size: NSSize
+    let actions: PortBridgePopoverActions
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if let error = appState.lastError {
+                Text("Last error: \(error)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                Divider()
+            }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    if appState.hosts.isEmpty {
+                        emptyState
+                    } else {
+                        ForEach(appState.hosts) { host in
+                            HostPanel(
+                                host: host,
+                                services: services(for: host),
+                                scanSummary: appState.lastScanSummary(for: host.id),
+                                actions: actions
+                            )
+                        }
+                    }
+                }
+                .padding(16)
+            }
+            Divider()
+            footer
+        }
+        .frame(width: size.width, height: size.height)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            Text("PortBridge")
+                .font(.system(size: 17, weight: .semibold))
+            Text(verbatim: appState.proxyRunning ? "http://*.localhost:\(appState.configuration.proxyPort)" : "Proxy stopped")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(appState.proxyRunning ? Color.secondary : Color.red)
+                .lineLimit(1)
+            Spacer()
+            Button("Index", action: actions.openIndex)
+                .buttonStyle(.borderless)
+                .font(.system(size: 12, weight: .medium))
+                .disabled(!appState.proxyRunning)
+                .help("Open PortBridge index")
+            iconButton("Restart proxy", systemName: "arrow.clockwise", action: actions.restartProxy)
+            iconButton("Open config", systemName: "doc.text.magnifyingglass", action: actions.openConfig)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Button("Import SSH Config", action: actions.importSSHConfig)
+            Button("Add Host", action: actions.addHost)
+            Spacer()
+            Button("Quit", action: actions.quit)
+        }
+        .buttonStyle(.borderless)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("No SSH hosts yet")
+                .font(.system(size: 15, weight: .semibold))
+            Text("Import ~/.ssh/config or add a host manually to start scanning.")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func services(for host: HostProfile) -> [ServiceRecord] {
+        appState.visibleServices.filter { $0.hostID == host.id }
+    }
+}
+
+@MainActor
+private struct HostPanel: View {
+    let host: HostProfile
+    let services: [ServiceRecord]
+    let scanSummary: String?
+    let actions: PortBridgePopoverActions
+    @State private var disabledPortsExpanded = false
+
+    private var activeServices: [ServiceRecord] {
+        services.filter { $0.enabled && $0.status == .web }
+    }
+
+    private var disabledServices: [ServiceRecord] {
+        services.filter { !$0.enabled || $0.status != .web }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 8) {
+                        Text(host.displayName)
+                            .font(.system(size: 15, weight: .semibold))
+                            .lineLimit(1)
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 8, height: 8)
+                            .help(statusText)
+                    }
+                    if let scanSummary {
+                        Text(scanSummary)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
+                Toggle("Auto", isOn: Binding(
+                    get: { host.autoForward },
+                    set: { _ in actions.toggleHostAutoForward(host.id) }
+                ))
+                .toggleStyle(.checkbox)
+                .help("Auto forward new HTTP/HTTPS ports")
+                Button(host.enabled ? "Disable" : "Enable") {
+                    actions.toggleHost(host.id)
+                }
+                Button("Scan") {
+                    actions.scanHost(host.id)
+                }
+                iconButton("Remove host", systemName: "trash", role: .destructive) {
+                    actions.removeHost(host.id)
+                }
+            }
+
+            if activeServices.isEmpty && disabledServices.isEmpty {
+                Text("No ports discovered yet")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 6)
+            }
+
+            if !activeServices.isEmpty {
+                serviceHeader("Active HTTP/HTTPS", count: activeServices.count)
+                ForEach(activeServices) { service in
+                    ServiceRow(service: service, actions: actions)
+                }
+                if activeServices.contains(where: \.enabled) {
+                    Button("Disable All Forwards") {
+                        actions.disableAllForwards(host.id)
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 12))
+                }
+            }
+
+            if !disabledServices.isEmpty {
+                DisclosureGroup(isExpanded: $disabledPortsExpanded) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(disabledServices) { service in
+                            ServiceRow(service: service, actions: actions)
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("Disabled Ports")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text("\(disabledServices.count)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.top, 4)
+            }
+        }
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var statusText: String {
+        return host.enabled ? "Connected" : "Disabled"
+    }
+
+    private var statusColor: Color {
+        return host.enabled ? .green : .secondary
+    }
+
+    private func serviceHeader(_ title: String, count: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+            Text("\(count)")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.top, 4)
+    }
+}
+
+@MainActor
+private struct ServiceRow: View {
+    let service: ServiceRecord
+    let actions: PortBridgePopoverActions
+
+    var body: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(service.title ?? "\(service.remotePort.port)")
+                        .font(.system(size: 13, weight: .medium))
+                        .lineLimit(1)
+                    Text(verbatim: ":\(service.remotePort.port)")
+                        .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Text(statusText)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Text(detailText)
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if service.enabled {
+                if service.status == .web {
+                    iconButton("Open pretty URL", systemName: "globe") {
+                        actions.openPrettyURL(service.id)
+                    }
+                    iconButton("Copy pretty URL", systemName: "doc.on.doc") {
+                        actions.copyPrettyURL(service.id)
+                    }
+                }
+                iconButton("Open localhost URL", systemName: "link") {
+                    actions.openLocalhostURL(service.id)
+                }
+                iconButton("Copy localhost URL", systemName: "square.on.square") {
+                    actions.copyLocalhostURL(service.id)
+                }
+                if service.status != .web || service.scheme == nil {
+                    Button("HTTP") {
+                        actions.forceHTTP(service.id)
+                    }
+                    .controlSize(.small)
+                    Button("HTTPS") {
+                        actions.forceHTTPS(service.id)
+                    }
+                    .controlSize(.small)
+                }
+                iconButton("Disable forward", systemName: "pause.circle") {
+                    actions.toggleService(service.id)
+                }
+            } else {
+                Button("Enable") {
+                    actions.toggleService(service.id)
+                }
+                .controlSize(.small)
+                Button("HTTP") {
+                    actions.forceHTTP(service.id)
+                }
+                .controlSize(.small)
+                Button("HTTPS") {
+                    actions.forceHTTPS(service.id)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var statusText: String {
+        if service.status == .web {
+            return service.scheme?.rawValue.uppercased() ?? "WEB"
+        }
+        return service.status.rawValue
+    }
+
+    private var detailText: String {
+        let local = "127.0.0.1:\(service.localPort)"
+        let remote = "\(service.remotePort.bindAddress):\(service.remotePort.port)"
+        if service.enabled, service.status == .web {
+            return "\(service.routeHost)  ->  \(local)  ->  \(remote)"
+        }
+        return "\(local)  ->  \(remote)"
+    }
+}
+
+@MainActor
+private func iconButton(
+    _ help: String,
+    systemName: String,
+    role: ButtonRole? = nil,
+    action: @escaping () -> Void
+) -> some View {
+    Button(role: role, action: action) {
+        Image(systemName: systemName)
+            .frame(width: 18, height: 18)
+    }
+    .buttonStyle(.borderless)
+    .controlSize(.small)
+    .help(help)
 }
 
 @MainActor

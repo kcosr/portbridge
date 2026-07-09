@@ -79,13 +79,21 @@ public final class ReverseProxyServer: @unchecked Sendable {
     }
 
     private func proxy(headerData: Data, bodyPrefix: Data, client: NWConnection) {
-        guard let header = String(data: headerData, encoding: .isoLatin1),
-              let host = parseHeader("Host", in: header),
-              let route = registry.route(for: host) else {
-            sendNotFound(to: client)
+        guard let header = String(data: headerData, encoding: .isoLatin1) else {
+            sendSimpleResponse(400, "Bad Request", to: client)
             return
         }
+        let host = parseHeader("Host", in: header)
+        if let host, let route = registry.route(for: host) {
+            proxy(route: route, headerData: headerData, bodyPrefix: bodyPrefix, client: client)
+        } else if host.map(isIndexHost) ?? true {
+            sendIndex(status: 200, reason: "OK", message: nil, to: client)
+        } else {
+            sendIndex(status: 404, reason: "Not Found", message: "No PortBridge route for \(htmlEscaped(host ?? "this host")).", to: client)
+        }
+    }
 
+    private func proxy(route: ProxyRoute, headerData: Data, bodyPrefix: Data, client: NWConnection) {
         let upstream = NWConnection(
             host: .ipv4(IPv4Address("127.0.0.1")!),
             port: NWEndpoint.Port(integerLiteral: NWEndpoint.Port.IntegerLiteralType(route.localPort)),
@@ -164,13 +172,67 @@ public final class ReverseProxyServer: @unchecked Sendable {
         return Data(text.utf8)
     }
 
-    private func sendNotFound(to client: NWConnection) {
+    private func sendIndex(status: Int, reason: String, message: String?, to client: NWConnection) {
         let routes = registry.allRoutes()
-        let items = routes.map { "<li><a href=\"http://\($0.hostname):\(port)\">\($0.hostname)</a> -> 127.0.0.1:\($0.localPort)</li>" }.joined()
+        let items = routes.isEmpty
+            ? "<li class=\"empty\">No active forwards yet.</li>"
+            : routes.map(routeListItem).joined()
+        let messageHTML = message.map { "<p class=\"notice\">\($0)</p>" } ?? ""
         let body = """
-<html><head><title>PortBridge</title></head><body><h1>No PortBridge route</h1><ul>\(items)</ul></body></html>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PortBridge</title>
+<style>
+:root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+body { margin: 0; padding: 40px; background: Canvas; color: CanvasText; }
+main { max-width: 880px; margin: 0 auto; }
+h1 { margin: 0 0 6px; font-size: 32px; letter-spacing: 0; }
+p { margin: 0 0 24px; color: color-mix(in srgb, CanvasText 68%, transparent); }
+.notice { margin: 18px 0; padding: 12px 14px; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 8px; }
+ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+li { border: 1px solid color-mix(in srgb, CanvasText 16%, transparent); border-radius: 8px; }
+a { display: grid; grid-template-columns: 1fr auto; gap: 10px; padding: 14px 16px; color: inherit; text-decoration: none; }
+a:hover { background: color-mix(in srgb, LinkText 8%, transparent); }
+.host { font-weight: 650; overflow-wrap: anywhere; }
+.meta { color: color-mix(in srgb, CanvasText 58%, transparent); font-variant-numeric: tabular-nums; }
+.empty { padding: 14px 16px; color: color-mix(in srgb, CanvasText 58%, transparent); }
+</style>
+</head>
+<body>
+<main>
+<h1>PortBridge</h1>
+<p>Available forwards</p>
+\(messageHTML)
+<ul>\(items)</ul>
+</main>
+</body>
+</html>
 """
-        sendResponse(status: 404, reason: "Not Found", body: body, to: client)
+        sendResponse(status: status, reason: reason, body: body, to: client)
+    }
+
+    private func routeListItem(_ route: ProxyRoute) -> String {
+        let href = "http://\(route.hostname):\(port)/"
+        return """
+<li><a href="\(htmlEscaped(href))"><span class="host">\(htmlEscaped(route.hostname))</span><span class="meta">\(route.upstreamScheme.rawValue.uppercased()) -> 127.0.0.1:\(route.localPort)</span></a></li>
+"""
+    }
+
+    private func isIndexHost(_ hostHeader: String) -> Bool {
+        let host = hostHeader.split(separator: ":").first.map { String($0).lowercased() } ?? hostHeader.lowercased()
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
+    private func htmlEscaped(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&#39;")
     }
 
     private func sendSimpleResponse(_ status: Int, _ reason: String, to client: NWConnection) {
@@ -179,14 +241,15 @@ public final class ReverseProxyServer: @unchecked Sendable {
 
     private func sendResponse(status: Int, reason: String, body: String, to client: NWConnection) {
         let data = Data(body.utf8)
-        let response = """
-HTTP/1.1 \(status) \(reason)\r
-Content-Type: text/html; charset=utf-8\r
-Content-Length: \(data.count)\r
-Connection: close\r
-\r
-"""
-        client.send(content: Data(response.utf8) + data, completion: .contentProcessed { _ in
+        let response = [
+            "HTTP/1.1 \(status) \(reason)",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Length: \(data.count)",
+            "Connection: close",
+            "",
+            "",
+        ].joined(separator: "\r\n")
+        client.send(content: Data(response.utf8) + data, isComplete: true, completion: .contentProcessed { _ in
             client.cancel()
         })
     }

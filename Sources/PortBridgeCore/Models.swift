@@ -222,6 +222,9 @@ public struct AppConfiguration: Codable, Equatable, Sendable {
     public mutating func normalizeLegacyServices() {
         var byKey: [ServiceIdentity: ServiceRecord] = [:]
         for service in services {
+            guard !RemotePortScanner.neverForwardPorts.contains(service.remotePort.port) else {
+                continue
+            }
             let key = ServiceIdentity(service)
             let cleaned = service.invalidatingMisclassifiedHTTPS()
             guard let existing = byKey[key] else {

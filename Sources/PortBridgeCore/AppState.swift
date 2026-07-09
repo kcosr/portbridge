@@ -57,7 +57,9 @@ public final class AppState {
     }
 
     public var visibleServices: [ServiceRecord] {
-        services.filter { $0.status != .notHTTP }
+        services.filter { service in
+            service.status != .notHTTP && !RemotePortScanner.neverForwardPorts.contains(service.remotePort.port)
+        }
     }
 
     public func start() {
