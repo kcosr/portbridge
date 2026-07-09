@@ -1,10 +1,15 @@
 # PortBridge
 
+> [!WARNING]
+> PortBridge is experimental personal software. It is useful for my development workflow, but it is not hardened, audited, packaged, or supported like a production networking tool. Expect rough edges, review what it does before running it, and use it at your own risk.
+
 PortBridge is a native macOS menu-bar app for discovering HTTP and HTTPS services on SSH hosts and exposing them through local browser URLs.
 
 It is built for dev containers, VMs, remote workstations, and local SSH targets where services bind to the remote host's `localhost` and are otherwise awkward to open from macOS.
 
 PortBridge does not start your services. It connects to a host with the system `ssh` binary, scans for listening TCP ports, creates local SSH forwards when you enable a service, probes those forwards for HTTP or HTTPS, and gives you click-to-open URLs.
+
+![PortBridge menu bar popover and proxy index](docs/portbridge-screenshot.png)
 
 ## Current State
 
